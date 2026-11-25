@@ -1,0 +1,297 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2870
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #include "esp_camera.h"\
+#include <FS.h>\
+#include <WiFi.h>\
+#include <WebServer.h>\
+#include <SPI.h>\
+#include <TFT_eSPI.h>\
+\
+TFT_eSPI tft = TFT_eSPI();\
+WebServer server(80);\
+\
+const int ACTION_PIN = 4;   // Button between 3.3V and GPIO4 (also the flash LED)\
+\
+// --- WiFi hotspot the ESP32 creates (join this on your phone) ---\
+const char* AP_SSID = "DigiCam";\
+const char* AP_PASS = "12345678";   // at least 8 characters\
+\
+// --- Photos are kept in PSRAM (lost when power is removed) ---\
+#define MAX_PHOTOS 5                // newest 5 photos are kept\
+uint8_t* photoBuf[MAX_PHOTOS] = \{nullptr\};\
+size_t   photoLen[MAX_PHOTOS] = \{0\};\
+int      photoNum[MAX_PHOTOS] = \{0\};\
+int      photoCount = 0;            // total photos taken so far\
+\
+bool captureInProgress = false;\
+\
+// --- AI-Thinker Camera Pins ---\
+#define PWDN_GPIO_NUM     32\
+#define RESET_GPIO_NUM    -1\
+#define XCLK_GPIO_NUM      0\
+#define SIOD_GPIO_NUM     26\
+#define SIOC_GPIO_NUM     27\
+#define Y9_GPIO_NUM       35\
+#define Y8_GPIO_NUM       34\
+#define Y7_GPIO_NUM       39\
+#define Y6_GPIO_NUM       36\
+#define Y5_GPIO_NUM       21\
+#define Y4_GPIO_NUM       19\
+#define Y3_GPIO_NUM       18\
+#define Y2_GPIO_NUM        5\
+#define VSYNC_GPIO_NUM    25\
+#define HREF_GPIO_NUM     23\
+#define PCLK_GPIO_NUM     22\
+\
+// ---------------------------------------------------------------\
+//  WEB SERVER (view / download photos on your phone)\
+// ---------------------------------------------------------------\
+void handleRoot() \{\
+  String html =\
+    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"\
+    "<title>DigiCam</title>"\
+    "<style>body\{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:12px;text-align:center\}"\
+    "img\{width:100%;max-width:640px;border-radius:8px\}"\
+    "a\{color:#6cf;font-size:18px\}.b\{display:inline-block;margin:6px 0 24px\}</style></head><body>"\
+    "<h2>DigiCam</h2><a href='/'>Refresh</a><br><br>";\
+\
+  bool any = false;\
+  // newest first\
+  for (int n = photoCount; n > photoCount - MAX_PHOTOS && n >= 1; n--) \{\
+    for (int i = 0; i < MAX_PHOTOS; i++) \{\
+      if (photoBuf[i] && photoNum[i] == n) \{\
+        any = true;\
+        html += "<div>Photo " + String(n) + "<br>";\
+        html += "<img loading='lazy' src='/photo?n=" + String(n) + "'><br>";\
+        html += "<a class='b' href='/photo?n=" + String(n) + "&dl=1'>Download</a></div>";\
+      \}\
+    \}\
+  \}\
+  if (!any) html += "<p>No photos yet. Press the shutter button, then tap Refresh.</p>";\
+  html += "</body></html>";\
+  server.send(200, "text/html", html);\
+\}\
+\
+void handlePhoto() \{\
+  int n = server.arg("n").toInt();\
+  for (int i = 0; i < MAX_PHOTOS; i++) \{\
+    if (photoBuf[i] && photoNum[i] == n) \{\
+      if (server.hasArg("dl")) \{\
+        char h[64];\
+        sprintf(h, "attachment; filename=\\"photo_%03d.jpg\\"", n);\
+        server.sendHeader("Content-Disposition", h);\
+      \}\
+      server.send_P(200, "image/jpeg", (const char*)photoBuf[i], photoLen[i]);\
+      return;\
+    \}\
+  \}\
+  server.send(404, "text/plain", "Photo not found");\
+\}\
+\
+// ---------------------------------------------------------------\
+//  CAMERA PIPELINES\
+// ---------------------------------------------------------------\
+// --- PIPELINE 1: Live viewfinder (uncompressed 160x120 for the 1.8" screen) ---\
+bool initCameraStream() \{\
+  camera_config_t config;\
+  config.ledc_channel = LEDC_CHANNEL_0;\
+  config.ledc_timer = LEDC_TIMER_0;\
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;\
+  config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;\
+  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;\
+  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;\
+  config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM;\
+  config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;\
+  config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;\
+  config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;\
+  config.xclk_freq_hz = 20000000;\
+\
+  config.pixel_format = PIXFORMAT_RGB565;\
+  config.frame_size = FRAMESIZE_QQVGA;     // 160x120\
+  config.jpeg_quality = 12;\
+  config.fb_count = 1;\
+  config.fb_location = CAMERA_FB_IN_PSRAM;\
+\
+  return (esp_camera_init(&config) == ESP_OK);\
+\}\
+\
+// --- PIPELINE 2: High-res capture (hardware JPEG, 1600x1200) ---\
+bool initCameraHD() \{\
+  camera_config_t config;\
+  config.ledc_channel = LEDC_CHANNEL_0;\
+  config.ledc_timer = LEDC_TIMER_0;\
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;\
+  config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;\
+  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;\
+  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;\
+  config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM;\
+  config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;\
+  config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;\
+  config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;\
+  config.xclk_freq_hz = 20000000;\
+\
+  config.pixel_format = PIXFORMAT_JPEG;\
+  config.frame_size = FRAMESIZE_UXGA;      // 1600x1200\
+  config.jpeg_quality = 5;                 // high quality (lower number = better)\
+  config.fb_count = 1;\
+  config.fb_location = CAMERA_FB_IN_PSRAM;\
+\
+  return (esp_camera_init(&config) == ESP_OK);\
+\}\
+\
+// ---------------------------------------------------------------\
+//  SETUP\
+// ---------------------------------------------------------------\
+void setup() \{\
+  // NO Serial.begin() - keep serial pins free\
+  pinMode(ACTION_PIN, INPUT_PULLDOWN);\
+\
+  tft.init();\
+  tft.setRotation(1);                  // screen becomes 160x128\
+  tft.invertDisplay(false);\
+  // tft.setSwapBytes(true);           // uncomment if red/blue colors look wrong\
+\
+  tft.fillScreen(TFT_BLACK);\
+  tft.setTextColor(TFT_WHITE);\
+  tft.drawString("Booting...", 10, 10, 2);\
+\
+  if (!initCameraStream()) \{\
+    tft.fillScreen(TFT_RED);\
+    tft.drawString("Camera Init Failed!", 5, 50, 2);\
+    while (true);\
+  \}\
+\
+  // Start the WiFi hotspot + web server\
+  WiFi.mode(WIFI_AP);\
+  WiFi.softAP(AP_SSID, AP_PASS);\
+  server.on("/", handleRoot);\
+  server.on("/photo", handlePhoto);\
+  server.begin();\
+\
+  tft.fillScreen(TFT_BLACK);\
+  tft.setTextColor(TFT_GREEN);\
+  tft.drawString("WiFi: DigiCam", 10, 40, 2);\
+  tft.drawString("192.168.4.1", 10, 65, 2);\
+  delay(2500);\
+\
+  tft.fillScreen(TFT_BLACK);\
+\}\
+\
+// ---------------------------------------------------------------\
+//  LOOP\
+// ---------------------------------------------------------------\
+void loop() \{\
+  server.handleClient();\
+\
+  if (digitalRead(ACTION_PIN) == HIGH && !captureInProgress) \{\
+    delay(50);\
+    if (digitalRead(ACTION_PIN) == HIGH) \{\
+      captureInProgress = true;\
+      handleSnapshot();\
+      captureInProgress = false;\
+    \}\
+  \}\
+\
+  camera_fb_t * fb = esp_camera_fb_get();\
+  if (!fb) return;\
+\
+  // 160x120 image centered on the 160x128 screen\
+  tft.pushImage(0, 4, 160, 120, (uint16_t *)fb->buf);\
+\
+  esp_camera_fb_return(fb);\
+  yield();\
+\}\
+\
+// ---------------------------------------------------------------\
+//  TAKE A PHOTO\
+// ---------------------------------------------------------------\
+void handleSnapshot() \{\
+  // 1. Pause and tear down the live stream\
+  tft.fillScreen(TFT_BLACK);\
+  tft.setTextColor(TFT_YELLOW);\
+  tft.drawString("Getting ready...", 10, 50, 2);\
+  esp_camera_deinit();\
+\
+  // 2. Start the high-res pipeline\
+  if (!initCameraHD()) \{\
+    tft.setTextColor(TFT_RED);\
+    tft.drawString("HD mode failed", 10, 70, 2);\
+    delay(2000);\
+    esp_camera_deinit();\
+    initCameraStream();\
+    tft.fillScreen(TFT_BLACK);\
+    return;\
+  \}\
+\
+  // 3. Flash on, let the sensor adjust, discard stale frames, grab the photo\
+  pinMode(ACTION_PIN, OUTPUT);\
+  digitalWrite(ACTION_PIN, HIGH);\
+  delay(500);\
+\
+  for (int i = 0; i < 2; i++) \{\
+    camera_fb_t * dummy_frame = esp_camera_fb_get();\
+    if (dummy_frame) esp_camera_fb_return(dummy_frame);\
+  \}\
+\
+  camera_fb_t * fb = esp_camera_fb_get();\
+\
+  digitalWrite(ACTION_PIN, LOW);\
+  pinMode(ACTION_PIN, INPUT_PULLDOWN);\
+\
+  if (!fb) \{\
+    esp_camera_deinit();\
+    initCameraStream();\
+    tft.fillScreen(TFT_BLACK);\
+    return;\
+  \}\
+\
+  // 4. Store the JPEG in PSRAM for the web page\
+  tft.setTextColor(TFT_GREEN);\
+  tft.drawString("Saving photo...", 10, 70, 2);\
+\
+  int slot = photoCount % MAX_PHOTOS;      // overwrites the oldest photo\
+  if (photoBuf[slot]) \{\
+    free(photoBuf[slot]);\
+    photoBuf[slot] = nullptr;\
+  \}\
+  photoBuf[slot] = (uint8_t*)ps_malloc(fb->len);\
+\
+  if (photoBuf[slot]) \{\
+    memcpy(photoBuf[slot], fb->buf, fb->len);\
+    photoLen[slot] = fb->len;\
+    photoCount++;\
+    photoNum[slot] = photoCount;\
+\
+    tft.fillScreen(TFT_BLACK);\
+    tft.setTextColor(TFT_GREEN);\
+    tft.drawString("Photo " + String(photoCount) + " saved!", 10, 40, 2);\
+    tft.drawString("WiFi: DigiCam", 10, 65, 2);\
+    tft.drawString("192.168.4.1", 10, 90, 2);\
+  \} else \{\
+    tft.fillScreen(TFT_BLACK);\
+    tft.setTextColor(TFT_RED);\
+    tft.drawString("Out of memory", 10, 60, 2);\
+  \}\
+\
+  esp_camera_fb_return(fb);\
+  delay(2500);\
+\
+  // 5. Restore the live viewfinder\
+  tft.fillScreen(TFT_BLACK);\
+  tft.setTextColor(TFT_WHITE);\
+  tft.drawString("Restoring...", 10, 60, 2);\
+\
+  esp_camera_deinit();\
+  initCameraStream();\
+\
+  // Wait for the button to be released so it doesn't retrigger\
+  unsigned long t = millis();\
+  while (digitalRead(ACTION_PIN) == HIGH && millis() - t < 3000) delay(10);\
+\
+  tft.fillScreen(TFT_BLACK);\
+\}}
